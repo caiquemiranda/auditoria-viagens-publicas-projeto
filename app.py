@@ -728,5 +728,3 @@ Todo o processo, com código e resultados, está em `tratamento_e_analise.ipynb`
 {"resumo": pagina_resumo, "evolucao": pagina_evolucao, "orgaos": pagina_orgaos, "perfil": pagina_perfil,
  "radar": pagina_radar, "metodo": pagina_metodo}[pag]()
 ```[cite: 20]
-
-É só substituir todo o conteúdo do `app.py` no GitHub, dar **Commit changes** e depois clicar em **Reboot app** no Streamlit Cloud para liberar a memória antiga.

@@ -10,11 +10,14 @@ https://portaldatransparencia.gov.br/download-de-dados/viagens
 
 ```
 app.py                       painel Streamlit (6 páginas)
-data/                        modelo em Star Schema (~50 MB, Parquet, sem nome nem CPF)
+data/                        modelo em Star Schema + camada agregada (sem nome nem CPF)
   fato_viagem_<ano>.parquet    tabela fato: 1 linha por viagem realizada
   dim_tempo / dim_orgao / dim_destino / dim_modal / dim_duracao .parquet   dimensões
   casos_<ano>.parquet          detalhe dos casos para revisão (com PCDP)
-pipeline/preparar_dados.py   gera data/ a partir dos zips brutos do Portal
+  cubo_viagens.npz             camada agregada lida pelo painel (~400 mil linhas)
+  valores_viagens_<ano>.npz    valor de cada viagem (só para medianas e curva de Pareto)
+pipeline/preparar_dados.py   gera o Star Schema a partir dos zips brutos do Portal
+pipeline/gerar_agregados.py  gera a camada agregada a partir do Star Schema
 tratamento_e_analise.ipynb   processo completo: dados brutos -> código -> resultado -> insights (já executado)
 tratamento_e_analise.html    o mesmo documento, para abrir no navegador
 requirements.txt
@@ -41,7 +44,8 @@ Os zips brutos (~1 GB, 7 GB descompactados) **não vão para o GitHub**: cada um
 Baixe-os no Portal, coloque-os em `dados_brutos/` (já ignorada pelo `.gitignore`) e rode:
 
 ```bash
-python pipeline/preparar_dados.py --zips dados_brutos
+python pipeline/preparar_dados.py --zips dados_brutos   # 1) Star Schema
+python pipeline/gerar_agregados.py                      # 2) camada agregada usada pelo painel
 ```
 
 ## Modelo de dados (Star Schema)
@@ -62,3 +66,12 @@ python pipeline/preparar_dados.py --zips dados_brutos
 - **Caso atípico:** log(custo/dia) acima de Q3 + 3×IQR entre viagens parecidas (mesmo ano, escopo, faixa de duração e com/sem avião), com valor ≥ R$ 1.000.
 - **Urgência** só a partir de 2021: antes de jun/2020 o campo não era preenchido.
 - **LGPD:** nome, CPF e identificador do viajante são descartados no tratamento.
+
+## Se o app cair no Streamlit Cloud ("Oh no. Error running app")
+
+O plano gratuito tem pouca memória e encerra o app sem mensagem nos logs quando ela acaba.
+Por isso o painel **não** carrega as 5 milhões de viagens: lê a camada agregada (`cubo_viagens.npz` e
+`valores_viagens_<ano>.npz`), em formato NumPy, sem o pool de memória do Arrow. Medido localmente:
+~250 MB na abertura e ~300 MB estáveis com filtros (a 1ª versão chegava a 1,5 GB).
+Se acontecer de novo: em *Manage app*, use **Reboot app**; se persistir, confira se o repositório tem a versão
+mais recente do `app.py` e os arquivos `.npz` da pasta `data/`, e baixe os logs em *Manage app*.

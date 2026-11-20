@@ -813,7 +813,8 @@ digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.5;
 4. **LGPD:** nome, CPF e identificador do viajante descartados.
 5. **Modelagem:** Star Schema em Parquet comprimido (~50 MB, ~140× menor que os CSVs).
 6. **Camada agregada para o painel:** um cubo (~400 mil linhas) derivado do Star Schema responde somas e taxas;
-   só o valor de cada viagem é mantido para medianas e Pareto. Assim o painel cabe na memória do plano gratuito.
+   medianas e Pareto vêm de estatísticas exatas (sem filtro) ou de um histograma de valores (com filtro, erro < 0,5%).
+   O painel não carrega dados viagem a viagem e cabe na memória do plano gratuito (~200 MB).
 7. **Caso atípico:** log(custo/dia) acima de Q3 + 3×IQR entre viagens parecidas e valor ≥ R$ 1.000.
 
 Todo o processo, com código e resultados, está em `tratamento_e_analise.ipynb`.

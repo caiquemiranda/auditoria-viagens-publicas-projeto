@@ -46,8 +46,8 @@ afirmamos que o trabalho remoto causou a queda de 2020.
 flowchart LR
     A["Portal da Transparência<br/>8 zips · ~7 GB de CSV"] --> B["pipeline/preparar_dados.py<br/>limpeza · regras · LGPD"]
     B --> C["Star Schema<br/>1 fato + 5 dimensões<br/>(Parquet, ~50 MB)"]
-    C --> D["pipeline/gerar_agregados.py<br/>cubo + valores (.npz)"]
-    D --> E["app.py<br/>Streamlit · Plotly<br/>~250 MB de RAM"]
+    C --> D["pipeline/gerar_agregados.py<br/>cubo + histograma (.npz)"]
+    D --> E["app.py<br/>Streamlit · Plotly<br/>~200 MB de RAM"]
     E --> F["Streamlit Community Cloud"]
 ```
 
@@ -58,7 +58,8 @@ flowchart LR
 - **Modelo dimensional (Star Schema):** a tabela fato tem uma linha por viagem com as medidas; as dimensões guardam
   o contexto (tempo, órgão, destino, transporte e duração).
 - **Camada agregada:** o painel não carrega as 5 milhões de viagens. Um cubo de ~400 mil linhas responde somas e taxas,
-  e só o valor de cada viagem é mantido para medianas e curva de Pareto. Assim o app cabe na memória do plano gratuito.
+  e medianas e curva de Pareto vêm de estatísticas exatas (sem filtro) ou de um histograma de valores (com filtro,
+  erro abaixo de 0,5%). O painel não carrega nenhum dado viagem a viagem e cabe na memória do plano gratuito.
 - **Caso atípico:** viagem com log(custo/dia) acima de Q3 + 3×IQR entre viagens parecidas (mesmo ano, escopo, faixa de
   duração e com/sem avião), com valor ≥ R$ 1.000.
 
@@ -100,7 +101,8 @@ data/
   casos_<ano>.parquet            detalhe dos casos para revisão (com PCDP)
   resumo_situacao.parquet        viagens realizadas × não realizadas (controle de qualidade)
   cubo_viagens.npz               camada agregada lida pelo painel
-  valores_viagens_<ano>.npz      valor de cada viagem (medianas e Pareto)
+  histograma_valores.npz         viagens e gasto por faixa de valor (medianas e Pareto com filtro)
+  estatisticas_exatas.json       medianas e Pareto exatos da base completa
 pipeline/
   preparar_dados.py              zips brutos → Star Schema
   gerar_agregados.py             Star Schema → camada agregada
@@ -136,7 +138,7 @@ python pipeline/gerar_agregados.py                      # 2) camada agregada usa
 2. A cada commit, o Streamlit Cloud redeploya sozinho; se não redeployar, use **Reboot app**.
 
 **Se o app cair ("Oh no. Error running app"):** o plano gratuito encerra o app sem mensagem quando falta memória.
-Esta versão foi feita para isso (~250 MB na abertura, ~300 MB com filtros; a primeira versão chegava a 1,5 GB).
+Esta versão foi feita para isso (~180 MB na abertura, ~220 MB estáveis com filtros; a primeira versão chegava a 1,5 GB).
 Confira se o repositório tem o `app.py` atual e os arquivos `.npz` em `data/`, use **Reboot app** e, se persistir,
 baixe os logs em *Manage app*.
 

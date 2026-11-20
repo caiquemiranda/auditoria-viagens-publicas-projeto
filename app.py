@@ -1,7 +1,8 @@
 """Radar de Viagens Públicas — painel de auditoria das viagens a serviço do Governo Federal (2019–2026).
 
 Fonte: Portal da Transparência (CGU) — Viagens a Serviço.
-Dados tratados e modelados em Star Schema por pipeline/preparar_dados.py (ver tratamento_e_analise.ipynb).
+Dados tratados e modelados em Star Schema por pipeline/preparar_dados.py; o painel lê a camada agregada
+gerada por pipeline/gerar_agregados.py (ver tratamento_e_analise.ipynb).
 """
 import gc
 import re
@@ -10,8 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -181,91 +180,96 @@ def grafico(fig, altura=360, legenda=False):
     st.plotly_chart(estilo(fig, altura, legenda), config={"displayModeBar": False}, **LARGURA)
 
 
-# ============================================================================ dados (Star Schema)
+# ============================================================================ dados (camada agregada do Star Schema)
 def _codigos(valores_por_sk):
     """Para uma dimensão com sk = 1..n, devolve (categorias, código da categoria de cada sk)."""
-    cats = sorted(pd.unique(np.asarray(valores_por_sk, dtype=object)))
+    cats = sorted(set(valores_por_sk))
     pos = {c: i for i, c in enumerate(cats)}
     return cats, np.array([pos[v] for v in valores_por_sk], dtype=np.int16)
 
 
 @st.cache_resource(show_spinner="Carregando o modelo de dados (8 anos de viagens)...")
 def carregar():
-    """Lê o Star Schema e monta a base analítica com o mínimo de memória.
+    """Carrega a camada agregada (pipeline/gerar_agregados.py), derivada do Star Schema.
 
-    O plano gratuito do Streamlit Cloud tem pouca RAM: por isso as dimensões entram como categorias criadas
-    direto dos códigos (sem arrays de texto), os valores ficam em float32 e o gasto real e nominal já vêm prontos.
+    O plano gratuito do Streamlit Cloud tem pouca memória. Por isso o painel NÃO carrega as 5 milhões de viagens
+    como tabela: usa um cubo agregado (~400 mil linhas) para somas, contagens e taxas, e só 6 colunas compactas por
+    viagem para medianas e curva de Pareto (que não podem ser somadas).
     """
-    cols = ["sk_tempo", "sk_orgao", "sk_destino", "sk_modal", "sk_duracao", "urgente", "dur",
-            "diarias", "passagens", "outros", "outlier"]
-    # lê ano a ano direto para arrays NumPy (sem DataFrame intermediário nem concat, que duplicariam a memória)
-    partes = {c: [] for c in cols}
-    for arq in sorted(glob(str(DATA / "fato_viagem_*.parquet"))):
-        tab = pq.read_table(arq, columns=cols)
-        for c in cols:
-            partes[c].append(tab.column(c).to_numpy())
-        del tab
-    fato = {c: pd.Series(np.concatenate(v), copy=False) for c, v in partes.items()}
-    del partes
-    pa.default_memory_pool().release_unused()  # devolve ao sistema a memória que o Arrow usou na leitura
-    dt = pd.read_parquet(DATA / "dim_tempo.parquet").sort_values("sk_tempo")
     do = pd.read_parquet(DATA / "dim_orgao.parquet").sort_values("sk_orgao")
     dd = pd.read_parquet(DATA / "dim_destino.parquet").sort_values("sk_destino")
     dm = pd.read_parquet(DATA / "dim_modal.parquet").sort_values("sk_modal")
     du = pd.read_parquet(DATA / "dim_duracao.parquet").sort_values("sk_duracao")
-
-    # relacionamentos fato -> dimensões (muitos-para-um) pelas chaves substitutas
-    pos_t = np.searchsorted(dt["sk_tempo"].to_numpy(), fato["sk_tempo"].to_numpy())
-    sk_dest = fato["sk_destino"].to_numpy() - 1
+    dt = pd.read_parquet(DATA / "dim_tempo.parquet")
     cat_esc, cod_esc = _codigos(dd["escopo"].tolist())
     cat_uf, cod_uf = _codigos(dd["uf"].tolist())
-    ano = dt["ano"].to_numpy().astype("int16")[pos_t]
-    total = (fato["diarias"].to_numpy(np.float32) + fato["passagens"].to_numpy(np.float32)
-             + fato["outros"].to_numpy(np.float32))
-    df = pd.DataFrame({
-        "ano": ano,
-        "mes": dt["mes"].to_numpy().astype("int8")[pos_t],
-        "dia_semana_ini": dt["dia_semana"].to_numpy().astype("int8")[pos_t],
-        "orgao": pd.Categorical.from_codes(fato["sk_orgao"].to_numpy() - 1, do["orgao"].tolist()),
+    orgaos = do["orgao"].tolist()
+
+    # .npz (NumPy comprimido) carrega direto em arrays, sem o pool de memória do Arrow
+    with np.load(DATA / "cubo_viagens.npz") as z:
+        k = {c: z[c] for c in z.files}
+    sk_dest = k["sk_destino"] - 1
+    C = pd.DataFrame({
+        "ano": k["ano"], "mes": k["mes"],
+        "orgao": pd.Categorical.from_codes(k["sk_orgao"] - 1, orgaos),
         "escopo": pd.Categorical.from_codes(cod_esc[sk_dest], cat_esc),
         "uf": pd.Categorical.from_codes(cod_uf[sk_dest], cat_uf),
-        "modal": pd.Categorical.from_codes(fato["sk_modal"].to_numpy() - 1, dm["modal"].tolist()),
-        "faixa_dur": pd.Categorical.from_codes(fato["sk_duracao"].to_numpy() - 1, du["faixa_dur"].tolist(), ordered=True),
-        "urgente": fato["urgente"].to_numpy(), "dur": fato["dur"].to_numpy(),
-        "outlier": fato["outlier"].to_numpy(),
-        "total": total,
-        "real": total * dt["fator_ipca"].to_numpy().astype(np.float32)[pos_t],
+        "modal": pd.Categorical.from_codes(k["sk_modal"] - 1, dm["modal"].tolist()),
+        "faixa_dur": pd.Categorical.from_codes(k["sk_duracao"] - 1, du["faixa_dur"].tolist(), ordered=True),
+        "urgente": k["urgente"], "outlier": k["outlier"],
     })
-    # composição (diárias/passagens/outros) só é usada num gráfico: guarda já agregada (milhares de linhas, não milhões)
-    comp = pd.DataFrame({"ano": df["ano"], "orgao": df["orgao"], "escopo": df["escopo"], "urgente": df["urgente"],
-                         "diarias": fato["diarias"].to_numpy(np.float32), "passagens": fato["passagens"].to_numpy(np.float32),
-                         "outros": fato["outros"].to_numpy(np.float32)})
-    comp = comp.groupby(["ano", "orgao", "escopo", "urgente"], observed=True)[["diarias", "passagens", "outros"]].sum().reset_index()
-    del fato, pos_t, sk_dest, total
-    df["fds"] = (df["dur"] >= 7) | ((df["dia_semana_ini"] + df["dur"] - 1) >= 5)
+    for c in ["n", "real", "total", "diarias", "passagens", "outros", "fds", "curta", "curta_fds"]:
+        C[c] = k[c]
+    C["n_out"] = np.where(C["outlier"], C["n"], 0)   # viagens atípicas
+    C["n_urg"] = np.where(C["urgente"], C["n"], 0)   # viagens urgentes
+    del k, sk_dest
+
+    partes = {c: [] for c in ["ano", "sk_orgao", "sk_destino", "urgente", "real", "total"]}
+    for arq in sorted(glob(str(DATA / "valores_viagens_*.npz"))):
+        with np.load(arq) as z:
+            for c in partes:
+                partes[c].append(z[c])
+    V = {"ano": np.concatenate(partes["ano"]).astype(np.int16),
+         "org": (np.concatenate(partes["sk_orgao"]) - 1).astype(np.int16),
+         "esc": cod_esc[np.concatenate(partes["sk_destino"]) - 1].astype(np.int8),
+         "urg": np.concatenate(partes["urgente"]).astype(bool),
+         "real": np.concatenate(partes["real"]).astype(np.float32),
+         "total": np.concatenate(partes["total"]).astype(np.float32)}
+    del partes
+
     casos = pd.concat([pd.read_parquet(a) for a in sorted(glob(str(DATA / "casos_*.parquet")))], ignore_index=True)
     fator = dt.groupby("ano")["fator_ipca"].first().to_dict()
     gc.collect()
-    pa.default_memory_pool().release_unused()
-    return df, casos, dd, fator, comp
+    return C, V, casos, dd, fator, cat_esc, orgaos
 
 
-df_all, casos_all, dim_destino, FATOR, COMP = carregar()
-ANOS = sorted(df_all["ano"].unique().tolist())
+CUBO, V, casos_all, dim_destino, FATOR, CAT_ESC, ORG_NOMES = carregar()
+ANOS = sorted(CUBO["ano"].unique().tolist())
 ANO_PARCIAL = max(ANOS)
-ORGAOS = df_all.groupby("orgao", observed=True)["total"].sum().sort_values(ascending=False).index.tolist()
-_cnt = df_all[df_all["ano"].isin([ANO_PARCIAL, ANO_PARCIAL - 1])].groupby(["ano", "mes"]).size().unstack(0).fillna(0)
+ORGAOS = CUBO.groupby("orgao", observed=True)["total"].sum().sort_values(ascending=False).index.tolist()
+_cnt = CUBO[CUBO["ano"].isin([ANO_PARCIAL, ANO_PARCIAL - 1])].groupby(["ano", "mes"])["n"].sum().unstack(0).fillna(0)
 MES_CORTE = int(max([m for m in _cnt.index if _cnt.loc[m, ANO_PARCIAL] >= 0.85 * _cnt.loc[m, ANO_PARCIAL - 1]] or [6]))
+
+
+@st.cache_resource(show_spinner=False)
+def estatisticas_base_completa():
+    """Medianas e concentração da base completa (valores corrigidos): calculadas uma vez e reutilizadas."""
+    r = V["real"]
+    med_ano = pd.Series(r).groupby(V["ano"]).median()
+    s = np.sort(r)[::-1]
+    cum = np.cumsum(s, dtype=np.float64) / s.sum()
+    return float(np.median(r)), med_ano, float(cum[len(s) // 100 - 1])
+
 
 # ============================================================================ filtros (barra lateral)
 PADRAO = {"f_anos": (ANOS[0], ANOS[-1]), "f_orgaos": [], "f_escopo": "Todos", "f_urg": "Todas", "f_real": True}
-for k, v in PADRAO.items():
-    st.session_state.setdefault(k, v)
+for k_, v_ in PADRAO.items():
+    st.session_state.setdefault(k_, v_)
 
 
 def resetar():
-    for k, v in PADRAO.items():
-        st.session_state[k] = v
+    for k_, v_ in PADRAO.items():
+        st.session_state[k_] = v_
 
 
 with st.sidebar:
@@ -289,15 +293,12 @@ a0, a1 = st.session_state.f_anos
 orgs = tuple(st.session_state.f_orgaos)
 esc, urg, real = st.session_state.f_escopo, st.session_state.f_urg, st.session_state.f_real
 UNID = "R$ de dez/2025" if real else "R$ nominais"
+VAL = "real" if real else "total"  # medida de gasto usada pelas páginas (corrigida pelo IPCA ou nominal)
+SEM_FILTRO = (a0, a1) == (ANOS[0], ANOS[-1]) and not orgs and esc == "Todos" and urg == "Todas"
 
 
-VAL = "real" if real else "total"  # coluna de gasto usada pelas páginas (corrigida pelo IPCA ou nominal)
-
-
-def filtrar(base, a0, a1, orgs, esc, urg):
-    """Recorte da base. Sem filtro, devolve a própria base (sem cópia). Sem cache de propósito: o recorte é
-    recalculado em milissegundos e liberado ao fim de cada execução, o que mantém a memória baixa no Streamlit Cloud."""
-    if (a0, a1) == (ANOS[0], ANOS[-1]) and not orgs and esc == "Todos" and urg == "Todas":
+def filtrar_cubo(base):
+    if SEM_FILTRO:
         return base
     m = base["ano"].between(a0, a1)
     if orgs:
@@ -309,7 +310,44 @@ def filtrar(base, a0, a1, orgs, esc, urg):
     return base.loc[m]
 
 
-df = filtrar(df_all, a0, a1, orgs, esc, urg)
+def mascara_valores():
+    """Máscara booleana sobre as viagens (para medianas e Pareto). None = sem filtro."""
+    if SEM_FILTRO:
+        return None
+    m = (V["ano"] >= a0) & (V["ano"] <= a1)
+    if orgs:
+        m &= np.isin(V["org"], [ORG_NOMES.index(o) for o in orgs])
+    if esc != "Todos":
+        m &= V["esc"] == CAT_ESC.index(esc)
+    if urg != "Todas":
+        m &= (V["urg"] == (urg == "Urgentes")) & (V["ano"] >= URG_DESDE)
+    return m
+
+
+df = filtrar_cubo(CUBO)
+MASK = mascara_valores()
+
+
+def valores(col):
+    return V[col] if MASK is None else V[col][MASK]
+
+
+def soma(d, por, col=None):
+    col = col or VAL
+    return d.groupby(por, observed=True)[col].sum()
+
+
+def media(d, por, col=None):
+    """Média ponderada por viagem (soma do valor ÷ número de viagens) a partir do cubo."""
+    col = col or VAL
+    g = d.groupby(por, observed=True)[[col, "n"]].sum()
+    return g[col] / g["n"]
+
+
+def share(d, por, num_col):
+    g = d.groupby(por, observed=True)[[num_col, "n"]].sum()
+    return g[num_col] / g["n"]
+
 
 # ============================================================================ cabeçalho + navegação
 st.markdown(f"""
@@ -317,7 +355,7 @@ st.markdown(f"""
   <div class="kicker">Auditoria cidadã · Governo Federal</div>
   <h1>Radar de Viagens Públicas</h1>
   <p>Quanto o governo gasta com viagens a serviço, quem gasta, como gasta e quais viagens merecem revisão:
-     {num(len(df_all) / 1e6, 2)} milhões de viagens de {ANOS[0]} a {ANOS[-1]}, organizadas para responder em segundos.</p>
+     {num(CUBO['n'].sum() / 1e6, 2)} milhões de viagens de {ANOS[0]} a {ANOS[-1]}, organizadas para responder em segundos.</p>
   <div class="chips"><span class="chip">📂 Portal da Transparência (CGU)</span><span class="chip">🗓️ {ANOS[0]}–{ANOS[-1]} ({ANO_PARCIAL} parcial)</span>
   <span class="chip">💱 Valores corrigidos pelo IPCA</span><span class="chip">🔒 Sem dados pessoais (LGPD)</span>
   <span class="chip">⭐ Modelo em Star Schema</span></div>
@@ -331,14 +369,14 @@ pag = st.segmented_control("Navegação", list(PAGINAS), format_func=PAGINAS.get
                            label_visibility="collapsed") or "resumo"
 st.query_params["p"] = pag
 
-if df.empty and pag != "resumo":
+if df["n"].sum() == 0 and pag != "resumo":
     st.warning("Nenhuma viagem com esses filtros.")
     st.stop()
 
 
 def anual_de(d, col=None):
     col = col or VAL
-    return d.groupby("ano").agg(valor=(col, "sum"), viagens=(col, "size"))
+    return d.groupby("ano").agg(valor=(col, "sum"), viagens=("n", "sum"))
 
 
 def barras_ano(serie, cores, texto=True, hover="%{x}: R$ %{y:.2f} bi", curto_x=False):
@@ -352,33 +390,32 @@ def barras_ano(serie, cores, texto=True, hover="%{x}: R$ %{y:.2f} bi", curto_x=F
 
 # ============================================================================ RESUMO EXECUTIVO
 def pagina_resumo():
-    VAL = "real"  # o resumo usa sempre a base completa em valores corrigidos, independente dos filtros
-    b = df_all
-    an = anual_de(b, VAL)
+    b, col = CUBO, "real"  # o resumo usa sempre a base completa em valores corrigidos
+    an = anual_de(b, col)
     nom = b.groupby("ano")["total"].sum()
-    ytd = b[b["mes"] <= MES_CORTE].groupby("ano")[VAL].sum()
+    ytd = b[b["mes"] <= MES_CORTE].groupby("ano")[col].sum()
     du = b[b["ano"] >= URG_DESDE]
-    vs = np.sort(b[VAL].to_numpy())[::-1]
-    cum = np.cumsum(vs) / vs.sum()
-    top1 = cum[len(vs) // 100 - 1]
-    fx = b.groupby("faixa_dur", observed=False).agg(v=(VAL, "size"), g=(VAL, "sum")).reindex(FAIXAS)
+    mediana, med_ano, top1 = estatisticas_base_completa()
+    fx = b.groupby("faixa_dur", observed=False).agg(v=("n", "sum"), g=(col, "sum")).reindex(FAIXAS)
     fx = fx / fx.sum()
     lv, lg = fx.loc[["31–90 dias", "> 90 dias"]].sum()
-    tk = du.groupby("urgente")[VAL].mean()
-    org = b.groupby("orgao", observed=True).agg(n=(VAL, "size"), g=(VAL, "sum"), at=("outlier", "mean"))
+    tk = media(du, "urgente", col)
+    org = b.groupby("orgao", observed=True).agg(n=("n", "sum"), g=(col, "sum"), o=("n_out", "sum"))
+    org["at"] = org["o"] / org["n"]
     top3 = org["g"].nlargest(3).sum() / org["g"].sum()
-    out = b[b["outlier"]]
+    n_tot, n_out = int(b["n"].sum()), int(b["n_out"].sum())
     r25 = an.loc[2025, "valor"] / an.loc[2019, "valor"]
+    p_urg = du["n_urg"].sum() / du["n"].sum()
 
     st.markdown('<div class="ins">🧭 <b>Em uma frase:</b> o gasto com viagens <b>voltou acima do nível pré-pandemia mesmo descontada a inflação</b>, '
                 'está <b>concentrado em poucas viagens longas</b> e tem a <b>urgência como padrão</b>. Isso aponta falta de planejamento '
                 'e mostra onde a auditoria deve olhar primeiro.</div>', unsafe_allow_html=True)
 
-    kpis(kpi(f"Gasto {ANOS[0]}–{ANOS[-1]}", brl_curto(b[VAL].sum()), "R$ de dez/2025", an["valor"].values),
-         kpi("Viagens realizadas", f"{num(len(b) / 1e6, 2)} mi", "processos de viagem", an["viagens"].values),
-         kpi("Ticket mediano", brl(b[VAL].median()), f"média {brl(b[VAL].mean())}", b.groupby("ano")[VAL].median().values),
-         kpi("Viagens urgentes", pct(du["urgente"].mean(), 0), f"desde {URG_DESDE}", du.groupby("ano")["urgente"].mean().values),
-         kpi("Casos atípicos", num(len(out)), f"{num(len(out) / len(b) * 1000, 1)} por mil viagens", b.groupby("ano")["outlier"].sum().values))
+    kpis(kpi(f"Gasto {ANOS[0]}–{ANOS[-1]}", brl_curto(b[col].sum()), "R$ de dez/2025", an["valor"].values),
+         kpi("Viagens realizadas", f"{num(n_tot / 1e6, 2)} mi", "processos de viagem", an["viagens"].values),
+         kpi("Ticket mediano", brl(mediana), f"média {brl(b[col].sum() / n_tot)}", med_ano.values),
+         kpi("Viagens urgentes", pct(p_urg, 0), f"desde {URG_DESDE}", share(du, "ano", "n_urg").values),
+         kpi("Casos atípicos", num(n_out), f"{num(n_out / n_tot * 1000, 1)} por mil viagens", b.groupby("ano")["n_out"].sum().values))
 
     def card(n_txt, tit, txt, conf, tags, decisao, fig, legenda=False):
         with st.container(border=True):
@@ -392,7 +429,8 @@ def pagina_resumo():
 
     c1, c2, c3 = st.columns(3, gap="medium")
     with c1:
-        f = barras_ano(an["valor"], [CINZA_CLARO if a in (2020, 2021) else (AZUL_CLARO if a == ANO_PARCIAL else AZUL) for a in an.index], texto=False, curto_x=True)
+        f = barras_ano(an["valor"], [CINZA_CLARO if a in (2020, 2021) else (AZUL_CLARO if a == ANO_PARCIAL else AZUL) for a in an.index],
+                       texto=False, curto_x=True)
         card(f"{num(r25, 2)}×", "Gasto pós-pandemia supera 2019",
              f"Em 2025 o gasto foi **{num(r25, 2)}× o de 2019 já descontada a inflação** (nominal: {num(nom[2025] / nom[2019], 2)}×). "
              f"A queda de {pct(1 - an.loc[2020, 'valor'] / an.loc[2019, 'valor'], 0)} na pandemia foi totalmente revertida.",
@@ -417,15 +455,15 @@ def pagina_resumo():
 
     c4, c5, c6 = st.columns(3, gap="medium")
     with c4:
-        t = du.groupby(["ano", "urgente"])[VAL].mean().unstack()
-        f = go.Figure()
+        t = media(du, ["ano", "urgente"], col).unstack()
         t.index = ["’" + str(a)[2:] for a in t.index]
+        f = go.Figure()
         f.add_scatter(x=t.index, y=t[True], name="Urgentes", mode="lines+markers", line=dict(color=LARANJA, width=2.5),
                       marker=dict(size=7), hovertemplate="Urgentes %{x}: R$ %{y:,.0f}<extra></extra>")
         f.add_scatter(x=t.index, y=t[False], name="Programadas", mode="lines+markers", line=dict(color=AZUL, width=2.5),
                       marker=dict(size=7), hovertemplate="Programadas %{x}: R$ %{y:,.0f}<extra></extra>")
         f.update_xaxes(type="category")
-        card(pct(du["urgente"].mean(), 0), "das viagens são \"urgentes\"",
+        card(pct(p_urg, 0), "das viagens são \"urgentes\"",
              f"Desde {URG_DESDE}, a maioria das viagens é marcada como urgente, e elas custam **{pct(tk[True] / tk[False] - 1, 0)} mais** "
              f"em média (passagens compradas em cima da hora).", "media", ["Planejamento", f"dado confiável desde {URG_DESDE}"],
              "instituir antecedência mínima de compra e exigir justificativa formal da urgência.", f, legenda=True)
@@ -438,11 +476,11 @@ def pagina_resumo():
              "**taxa de casos atípicos por mil viagens** mostra onde olhar.", "media", ["Órgãos", "Normalização"],
              "comparar órgãos pela taxa, não pelo total, e cobrar explicação de quem está acima da média.", f)
     with c6:
-        ca = b.groupby("ano")["outlier"].sum()
-        f = go.Figure(go.Bar(x=["’" + str(a)[2:] for a in ca.index], y=ca.values, marker_color=AZUL, hovertemplate="%{x}: %{y:,.0f} casos<extra></extra>"))
-        f.update_xaxes(type="category")
-        card(num(len(out)), "viagens na fila de revisão",
-             f"Viagens com **custo por dia muito acima de viagens parecidas** (≈ {pct(len(out) / len(b))} do total). "
+        ca = b.groupby("ano")["n_out"].sum()
+        f = go.Figure(go.Bar(x=["’" + str(a)[2:] for a in ca.index], y=ca.values, marker_color=AZUL,
+                             hovertemplate="%{x}: %{y:,.0f} casos<extra></extra>"))
+        card(num(n_out), "viagens na fila de revisão",
+             f"Viagens com **custo por dia muito acima de viagens parecidas** (≈ {pct(n_out / n_tot)} do total). "
              "Cada uma tem a PCDP para conferência no Portal, sem expor o servidor.", "media", ["Radar", "Q3 + 3×IQR"],
              "transformar a lista em fila de auditoria amostral: uma lista viável, em vez de milhões de linhas.", f)
 
@@ -454,16 +492,19 @@ def pagina_resumo():
 # ============================================================================ EVOLUÇÃO
 def pagina_evolucao():
     an = anual_de(df)
-    tot, n = df[VAL].sum(), len(df)
+    tot, n = df[VAL].sum(), int(df["n"].sum())
     du = df[df["ano"] >= URG_DESDE]
+    vals, vano = valores(VAL), valores("ano")
+    med_ano = pd.Series(vals).groupby(vano).median()
     comp = [a for a in an.index if a != ANO_PARCIAL]
     dlt = an["valor"].loc[comp[-1]] / an["valor"].loc[comp[-2]] - 1 if len(comp) >= 2 else None
+    tem_urg = du["n"].sum() > 0
     kpis(kpi("Gasto total", brl_curto(tot), UNID, an["valor"].values, dlt),
          kpi("Viagens", f"{num(n / 1e6, 2)} mi" if n >= 1e6 else num(n), "realizadas", an["viagens"].values),
          kpi("Ticket médio", brl(tot / n), "gasto ÷ viagens", (an["valor"] / an["viagens"]).values),
-         kpi("Ticket mediano", brl(df[VAL].median()), "metade custa menos que isso", df.groupby("ano")[VAL].median().values),
-         kpi("Urgentes", pct(du["urgente"].mean(), 0) if len(du) else "—", f"desde {URG_DESDE}",
-             du.groupby("ano")["urgente"].mean().values if len(du) else None))
+         kpi("Ticket mediano", brl(float(np.median(vals))), "metade custa menos que isso", med_ano.values),
+         kpi("Urgentes", pct(du["n_urg"].sum() / du["n"].sum(), 0) if tem_urg else "—", f"desde {URG_DESDE}",
+             share(du, "ano", "n_urg").values if tem_urg else None))
     if dlt is not None:
         st.caption(f"▲▼ variação de {comp[-1]} sobre {comp[-2]} (últimos anos completos) · mini-linhas = tendência anual")
 
@@ -491,7 +532,7 @@ def pagina_evolucao():
     c3, c4 = st.columns(2, gap="medium")
     with c3, st.container(border=True):
         titulo("Composição do gasto", "Diárias, passagens e outros gastos por ano · R$ bilhões")
-        cp = filtrar(COMP, a0, a1, orgs, esc, urg).groupby("ano")[["diarias", "passagens", "outros"]].sum().astype(float)
+        cp = df.groupby("ano")[["diarias", "passagens", "outros"]].sum().astype(float)
         cp = cp.mul(np.array([FATOR[a] for a in cp.index]) if real else 1.0, axis=0) / 1e9
         f = go.Figure()
         for c, nome, cor in [("diarias", "Diárias", AZUL), ("passagens", "Passagens", LARANJA), ("outros", "Outros", AQUA)]:
@@ -502,7 +543,8 @@ def pagina_evolucao():
         grafico(f, 330, True)
     with c4, st.container(border=True):
         titulo("Sazonalidade", f"Viagens por mês de início · destaques: 2019, 2020 e {ANO_PARCIAL - 1}")
-        mens = df.groupby(["ano", "mes"]).size().reset_index(name="v")
+        mens = df.groupby(["ano", "mes"])["n"].sum().reset_index(name="v")
+        mens = mens[mens["v"] > 0]
         f = go.Figure()
         for a in sorted(mens["ano"].unique()):
             s = mens[mens["ano"] == a]
@@ -515,13 +557,17 @@ def pagina_evolucao():
 
 # ============================================================================ ÓRGÃOS
 def pagina_orgaos():
-    org = df.groupby("orgao", observed=True).agg(viagens=(VAL, "size"), gasto=(VAL, "sum"),
-                                                 mediana=(VAL, "median"), atip=("outlier", "mean")).reset_index()
-    org = org.merge(df[df["ano"] >= URG_DESDE].groupby("orgao", observed=True)["urgente"].mean().rename("urg").reset_index(),
-                    on="orgao", how="left")
+    org = df.groupby("orgao", observed=True).agg(viagens=("n", "sum"), gasto=(VAL, "sum"), o=("n_out", "sum"))
+    org = org[org["viagens"] > 0]
+    med = pd.Series(valores(VAL)).groupby(valores("org")).median()
+    org["mediana"] = [med.get(ORG_NOMES.index(o), np.nan) for o in org.index]
+    du = df[df["ano"] >= URG_DESDE]
+    urg_org = share(du, "orgao", "n_urg") if du["n"].sum() > 0 else pd.Series(dtype=float)
+    org["urg"] = urg_org.reindex(org.index)
+    org["atip"] = org["o"] / org["viagens"]
     org["ticket"] = org["gasto"] / org["viagens"]
     org["part"] = org["gasto"] / org["gasto"].sum()
-    org = org.sort_values("gasto", ascending=False)
+    org = org.sort_values("gasto", ascending=False).reset_index()
     t0 = org.iloc[0]
     st.markdown(f'<div class="ins">💡 Os <b>3 maiores órgãos</b> concentram <b>{pct(org["part"].head(3).sum(), 0)}</b> do gasto. '
                 f'<b>{t0["orgao"]}</b> lidera com <b>{num(t0["viagens"])}</b> viagens: gasto alto reflete volume, não necessariamente ineficiência. '
@@ -551,7 +597,7 @@ def pagina_orgaos():
 
     with st.container(border=True):
         titulo("Tabela comparativa normalizada", "Clique no cabeçalho para ordenar · urgência medida a partir de 2021")
-        tab = pd.DataFrame({"Órgão": org["orgao"], "Viagens": org["viagens"], "Gasto (R$ mi)": org["gasto"] / 1e6,
+        tab = pd.DataFrame({"Órgão": org["orgao"].astype(str), "Viagens": org["viagens"], "Gasto (R$ mi)": org["gasto"] / 1e6,
                             "% do gasto": org["part"] * 100, "Ticket médio": org["ticket"], "Mediana": org["mediana"],
                             "% urgentes": org["urg"] * 100, "Atípicos/mil": org["atip"] * 1000})
         st.dataframe(tab, hide_index=True, height=400, **LARGURA, column_config={
@@ -568,12 +614,13 @@ def pagina_orgaos():
 # ============================================================================ PERFIL
 def pagina_perfil():
     tot = df[VAL].sum()
-    fx = df.groupby("faixa_dur", observed=False).agg(v=(VAL, "size"), g=(VAL, "sum")).reindex(FAIXAS).fillna(0)
+    fx = df.groupby("faixa_dur", observed=False).agg(v=("n", "sum"), g=(VAL, "sum")).reindex(FAIXAS).fillna(0)
     fx["pv"], fx["pg"] = fx["v"] / fx["v"].sum(), fx["g"] / tot
     lv, lg = fx.loc[["31–90 dias", "> 90 dias"], ["pv", "pg"]].sum()
-    vs = np.sort(df[VAL].to_numpy())[::-1]
-    cum = np.cumsum(vs) / vs.sum()
-    k1 = max(1, len(vs) // 100)
+    vs = np.sort(valores(VAL))[::-1]
+    cum = np.cumsum(vs, dtype=np.float64) / vs.sum()
+    del vs
+    k1 = max(1, len(cum) // 100)
     st.markdown(f'<div class="ins">💡 <b>Concentração:</b> 1% das viagens responde por <b>{pct(cum[k1 - 1], 0)}</b> do gasto. '
                 f'Viagens com mais de 30 dias são <b>{pct(lv)}</b> das viagens e <b>{pct(lg, 0)}</b> do gasto.</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2, gap="medium")
@@ -601,7 +648,7 @@ def pagina_perfil():
     c3, c4 = st.columns(2, gap="medium")
     with c3, st.container(border=True):
         titulo("Meio de transporte principal", "Gasto em R$ bilhões · viagem com trecho aéreo conta como Aéreo")
-        md = df.groupby("modal", observed=True).agg(v=(VAL, "size"), g=(VAL, "sum")).sort_values("g")
+        md = df.groupby("modal", observed=True).agg(v=("n", "sum"), g=(VAL, "sum")).sort_values("g")
         md = md[md["g"] > 0]
         f = go.Figure(go.Bar(x=md["g"] / 1e9, y=md.index.astype(str), orientation="h", marker_color=AZUL,
                              text=[pct(g / tot, 0) for g in md["g"]], textposition="outside", cliponaxis=False,
@@ -612,9 +659,9 @@ def pagina_perfil():
     with c4, st.container(border=True):
         titulo("Para onde vão", "UF do 1º destino · viagens nacionais · tamanho = gasto")
         geo = dim_destino[dim_destino["lat"].notna()][["uf", "nome_uf", "lat", "lon"]].drop_duplicates("uf")
-        uf = df[df["escopo"] == "Nacional"].groupby("uf", observed=True).agg(g=(VAL, "sum"), v=(VAL, "size")).reset_index()
+        uf = df[df["escopo"] == "Nacional"].groupby("uf", observed=True).agg(g=(VAL, "sum"), v=("n", "sum")).reset_index()
         uf["uf"] = uf["uf"].astype(str)
-        uf = uf.merge(geo, on="uf")
+        uf = uf[uf["v"] > 0].merge(geo, on="uf")
         if len(uf):
             f = go.Figure(go.Scattergeo(lat=uf["lat"], lon=uf["lon"], text=uf["uf"], mode="markers+text",
                                         textfont=dict(size=10, color=TINTA, family=FONTE),
@@ -635,15 +682,17 @@ def pagina_radar():
     st.markdown('<div class="ins warn">🧭 <b>Como ler:</b> caso atípico é a viagem com <b>custo por dia muito acima de viagens parecidas</b> '
                 '(mesmo ano, escopo, faixa de duração e com/sem avião), pela regra <b>Q3 + 3×IQR em escala log</b>. '
                 'É um <b>sinal para revisão</b>, não prova de irregularidade.</div>', unsafe_allow_html=True)
-    out = df[df["outlier"]]
-    kpis(kpi("Casos atípicos", num(len(out)), "viagens sinalizadas", df.groupby("ano")["outlier"].sum().values),
-         kpi("Por mil viagens", num(len(out) / len(df) * 1000, 1), "taxa normalizada", (df.groupby("ano")["outlier"].mean() * 1000).values),
-         kpi("Valor dos casos", brl_curto(out[VAL].sum()), UNID),
-         kpi("Parcela do gasto", pct(out[VAL].sum() / df[VAL].sum()), "do total filtrado"), colunas=4)
+    n_tot, n_out = df["n"].sum(), df["n_out"].sum()
+    v_out = df.loc[df["outlier"], VAL].sum()
+    kpis(kpi("Casos atípicos", num(n_out), "viagens sinalizadas", df.groupby("ano")["n_out"].sum().values),
+         kpi("Por mil viagens", num(n_out / n_tot * 1000, 1), "taxa normalizada", (share(df, "ano", "n_out") * 1000).values),
+         kpi("Valor dos casos", brl_curto(v_out), UNID),
+         kpi("Parcela do gasto", pct(v_out / df[VAL].sum()), "do total filtrado"), colunas=4)
     c1, c2 = st.columns(2, gap="medium")
     with c1, st.container(border=True):
         titulo("Órgãos com maior taxa de casos atípicos", "Por mil viagens · mínimo de 2.000 viagens no filtro")
-        ot = df.groupby("orgao", observed=True).agg(n=("outlier", "size"), t=("outlier", "mean")).reset_index()
+        ot = df.groupby("orgao", observed=True).agg(n=("n", "sum"), o=("n_out", "sum")).reset_index()
+        ot["t"] = ot["o"] / ot["n"]
         ot = ot[ot["n"] >= 2000].nlargest(10, "t").iloc[::-1]
         f = go.Figure(go.Bar(x=ot["t"] * 1000, y=ot["orgao"].map(curto), orientation="h", marker_color=LARANJA,
                              text=[num(v * 1000, 1) for v in ot["t"]], textposition="outside", cliponaxis=False, customdata=ot["n"],
@@ -653,26 +702,27 @@ def pagina_radar():
     with c2, st.container(border=True):
         du = df[df["ano"] >= URG_DESDE]
         titulo("Urgentes × programadas", f"Ticket médio por ano (R$) · desde {URG_DESDE}")
-        u = du.groupby(["ano", "urgente"])[VAL].mean().unstack()
         f = go.Figure()
-        for flag, nome, cor in [(True, "Urgentes", LARANJA), (False, "Programadas", AZUL)]:
-            if flag in u:
-                f.add_scatter(x=u.index.astype(str), y=u[flag], name=nome, mode="lines+markers", line=dict(color=cor, width=2.6),
-                              marker=dict(size=8, line=dict(color="#fff", width=1.5)), hovertemplate=nome + " %{x}: R$ %{y:,.0f}<extra></extra>")
+        if du["n"].sum() > 0:
+            u = media(du, ["ano", "urgente"]).unstack()
+            for flag, nome, cor in [(True, "Urgentes", LARANJA), (False, "Programadas", AZUL)]:
+                if flag in u:
+                    f.add_scatter(x=u.index.astype(str), y=u[flag], name=nome, mode="lines+markers", line=dict(color=cor, width=2.6),
+                                  marker=dict(size=8, line=dict(color="#fff", width=1.5)), hovertemplate=nome + " %{x}: R$ %{y:,.0f}<extra></extra>")
         f.update_layout(hovermode="x unified")
         f.update_xaxes(type="category")
         grafico(f, 400, True)
 
     with st.expander("❓ Por que \"viagem cara que inclui fim de semana\" não é, sozinho, um indício"):
-        fz = df.groupby("faixa_dur", observed=False)["fds"].mean().reindex(FAIXAS) * 100
+        fz = (share(df, "faixa_dur", "fds").reindex(FAIXAS) * 100).fillna(0)
         f = go.Figure(go.Bar(x=FAIXAS, y=fz, marker_color=[CINZA_CLARO] * 3 + [LARANJA] * 3, text=[num(v, 0) + "%" for v in fz],
                              textposition="outside", hovertemplate="%{x}: %{y:.1f}% incluem sáb/dom<extra></extra>"))
         f.update_yaxes(range=[0, 115], ticksuffix="%")
         grafico(f, 280)
-        curtas = df[df["dur"] <= 3]
+        curtas = df["curta"].sum()
         st.markdown(f"Toda viagem com 7 dias ou mais inclui um fim de semana, e as viagens mais caras são justamente as longas. "
-                    f"O indicador útil olha as **viagens curtas (até 3 dias)**: delas, **{pct((curtas['dia_semana_ini'] >= 5).mean())}** "
-                    f"começam no sábado ou domingo.")
+                    f"O indicador útil olha as **viagens curtas (até 3 dias)**: delas, "
+                    f"**{pct(df['curta_fds'].sum() / curtas) if curtas else '—'}** começam no sábado ou domingo.")
 
     with st.container(border=True):
         titulo("📋 Fila de revisão", "Casos atípicos, maior valor primeiro · valores nominais · a PCDP permite conferir no Portal da Transparência")
@@ -703,7 +753,7 @@ def pagina_metodo():
     c1, c2 = st.columns([1.15, 1], gap="medium")
     with c1, st.container(border=True):
         titulo("⭐ Modelo de dados (Star Schema)", "1 tabela fato + 5 dimensões, ligadas por chaves substitutas (sk_*) · relação muitos-para-um")
-        DOT = """
+        dot = """
 digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.5;
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#d5dae3", fillcolor="#f8fafc", fontcolor="#0f172a"];
   edge [color="#94a3b8", arrowhead=crow, arrowsize=0.7];
@@ -716,9 +766,9 @@ digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.5;
   T -> F; O -> F; D -> F; M -> F; U -> F; }
 """
         try:
-            st.graphviz_chart(DOT, **LARGURA)
+            st.graphviz_chart(dot, **LARGURA)
         except TypeError:  # versões do Streamlit sem o parâmetro de largura
-            st.graphviz_chart(DOT)
+            st.graphviz_chart(dot)
     with c2, st.container(border=True):
         titulo("Indicadores (KPIs)", "Como cada número do painel é calculado")
         st.markdown("""
@@ -741,7 +791,9 @@ digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.5;
 3. **Enriquecimento:** duração, custo/dia, escopo e UF (texto de *Destinos*), meio principal (tabela *Trecho*).
 4. **LGPD:** nome, CPF e identificador do viajante descartados.
 5. **Modelagem:** Star Schema em Parquet comprimido (~50 MB, ~140× menor que os CSVs).
-6. **Caso atípico:** log(custo/dia) acima de Q3 + 3×IQR entre viagens parecidas e valor ≥ R$ 1.000.
+6. **Camada agregada para o painel:** um cubo (~400 mil linhas) derivado do Star Schema responde somas e taxas;
+   só o valor de cada viagem é mantido para medianas e Pareto. Assim o painel cabe na memória do plano gratuito.
+7. **Caso atípico:** log(custo/dia) acima de Q3 + 3×IQR entre viagens parecidas e valor ≥ R$ 1.000.
 
 Todo o processo, com código e resultados, está em `tratamento_e_analise.ipynb`.
 """)

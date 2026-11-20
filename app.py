@@ -5,6 +5,7 @@ Dados tratados e modelados em Star Schema por pipeline/preparar_dados.py; o pain
 gerada por pipeline/gerar_agregados.py (ver tratamento_e_analise.ipynb).
 """
 import gc
+import json
 import re
 from glob import glob
 from pathlib import Path
@@ -224,41 +225,25 @@ def carregar():
     C["n_urg"] = np.where(C["urgente"], C["n"], 0)   # viagens urgentes
     del k, sk_dest
 
-    partes = {c: [] for c in ["ano", "sk_orgao", "sk_destino", "urgente", "real", "total"]}
-    for arq in sorted(glob(str(DATA / "valores_viagens_*.npz"))):
-        with np.load(arq) as z:
-            for c in partes:
-                partes[c].append(z[c])
-    V = {"ano": np.concatenate(partes["ano"]).astype(np.int16),
-         "org": (np.concatenate(partes["sk_orgao"]) - 1).astype(np.int16),
-         "esc": cod_esc[np.concatenate(partes["sk_destino"]) - 1].astype(np.int8),
-         "urg": np.concatenate(partes["urgente"]).astype(bool),
-         "real": np.concatenate(partes["real"]).astype(np.float32),
-         "total": np.concatenate(partes["total"]).astype(np.float32)}
-    del partes
+    # medianas e Pareto: histograma de valores (com filtro) e estatísticas exatas (sem filtro), já pré-calculados
+    with np.load(DATA / "histograma_valores.npz") as z:
+        H = {c: z[c] for c in z.files}
+    assert list(H["escopos"]) == cat_esc, "escopos do histograma diferentes das dimensões"
+    exatas = json.load(open(DATA / "estatisticas_exatas.json", encoding="utf-8"))
 
     casos = pd.concat([pd.read_parquet(a) for a in sorted(glob(str(DATA / "casos_*.parquet")))], ignore_index=True)
     fator = dt.groupby("ano")["fator_ipca"].first().to_dict()
     gc.collect()
-    return C, V, casos, dd, fator, cat_esc, orgaos
+    return C, H, exatas, casos, dd, fator, cat_esc, orgaos
 
 
-CUBO, V, casos_all, dim_destino, FATOR, CAT_ESC, ORG_NOMES = carregar()
+CUBO, H, EXATAS, casos_all, dim_destino, FATOR, CAT_ESC, ORG_NOMES = carregar()
 ANOS = sorted(CUBO["ano"].unique().tolist())
 ANO_PARCIAL = max(ANOS)
 ORGAOS = CUBO.groupby("orgao", observed=True)["total"].sum().sort_values(ascending=False).index.tolist()
 _cnt = CUBO[CUBO["ano"].isin([ANO_PARCIAL, ANO_PARCIAL - 1])].groupby(["ano", "mes"])["n"].sum().unstack(0).fillna(0)
 MES_CORTE = int(max([m for m in _cnt.index if _cnt.loc[m, ANO_PARCIAL] >= 0.85 * _cnt.loc[m, ANO_PARCIAL - 1]] or [6]))
 
-
-@st.cache_resource(show_spinner=False)
-def estatisticas_base_completa():
-    """Medianas e concentração da base completa (valores corrigidos): calculadas uma vez e reutilizadas."""
-    r = V["real"]
-    med_ano = pd.Series(r).groupby(V["ano"]).median()
-    s = np.sort(r)[::-1]
-    cum = np.cumsum(s, dtype=np.float64) / s.sum()
-    return float(np.median(r)), med_ano, float(cum[len(s) // 100 - 1])
 
 
 # ============================================================================ filtros (barra lateral)
@@ -310,26 +295,65 @@ def filtrar_cubo(base):
     return base.loc[m]
 
 
-def mascara_valores():
-    """Máscara booleana sobre as viagens (para medianas e Pareto). None = sem filtro."""
-    if SEM_FILTRO:
-        return None
-    m = (V["ano"] >= a0) & (V["ano"] <= a1)
+def celulas_filtradas():
+    """Células do histograma (ano × órgão × escopo × urgência) que entram no filtro atual."""
+    m = (H["cel_ano"] >= a0) & (H["cel_ano"] <= a1)
     if orgs:
-        m &= np.isin(V["org"], [ORG_NOMES.index(o) for o in orgs])
+        m &= np.isin(H["cel_org"] - 1, [ORG_NOMES.index(o) for o in orgs])
     if esc != "Todos":
-        m &= V["esc"] == CAT_ESC.index(esc)
+        m &= H["cel_esc"] == CAT_ESC.index(esc)
     if urg != "Todas":
-        m &= (V["urg"] == (urg == "Urgentes")) & (V["ano"] >= URG_DESDE)
+        m &= (H["cel_urg"] == (urg == "Urgentes")) & (H["cel_ano"] >= URG_DESDE)
     return m
 
 
 df = filtrar_cubo(CUBO)
-MASK = mascara_valores()
+CEL = celulas_filtradas()
 
 
-def valores(col):
-    return V[col] if MASK is None else V[col][MASK]
+def _mediana_hist(cont):
+    """Mediana a partir das contagens por faixa de valor (interpolação geométrica dentro da faixa)."""
+    n = cont.sum()
+    if n == 0:
+        return np.nan
+    acum = np.cumsum(cont)
+    i = int(np.searchsorted(acum, n / 2))
+    if i == 0:
+        return 0.0
+    antes = acum[i - 1]
+    frac = (n / 2 - antes) / cont[i] if cont[i] else 0.0
+    lo, hi = H["faixas"][i - 1], H["faixas"][min(i, len(H["faixas"]) - 1)]
+    return float(lo * (hi / lo) ** frac)
+
+
+def mediana_geral(col):
+    """Mediana exata sem filtro; com filtro, estimada pelo histograma (erro máximo ~3%)."""
+    if SEM_FILTRO:
+        return EXATAS[col]["mediana"]
+    return _mediana_hist(H[f"n_{col}"][CEL].sum(axis=0))
+
+
+def mediana_por(col, chave):
+    """Mediana por ano ou por órgão (exata sem filtro; pelo histograma com filtro)."""
+    if SEM_FILTRO:
+        if chave == "ano":
+            return pd.Series({int(k): v for k, v in EXATAS[col]["mediana_ano"].items()}).sort_index()
+        return pd.Series({ORG_NOMES[int(k) - 1]: v for k, v in EXATAS[col]["mediana_orgao"].items()})
+    grupo = H["cel_ano"][CEL] if chave == "ano" else np.array(ORG_NOMES)[H["cel_org"][CEL] - 1]
+    cont = pd.DataFrame(H[f"n_{col}"][CEL]).groupby(grupo).sum()
+    return pd.Series({g: _mediana_hist(cont.loc[g].to_numpy()) for g in cont.index}).sort_index()
+
+
+def pareto(col):
+    """Curva de concentração: x = fração das viagens (mais caras primeiro), y = fração acumulada do gasto."""
+    if SEM_FILTRO:
+        p = EXATAS[col]["pareto"]
+        return np.array(p["x"]), np.array(p["y"])
+    cont = H[f"n_{col}"][CEL].sum(axis=0)[::-1].astype(float)
+    soma_v = H[f"s_{col}"][CEL].sum(axis=0)[::-1]
+    x = np.concatenate([[0], np.cumsum(cont) / max(cont.sum(), 1)])
+    y = np.concatenate([[0], np.cumsum(soma_v) / max(soma_v.sum(), 1)])
+    return x, y
 
 
 def soma(d, por, col=None):
@@ -395,7 +419,9 @@ def pagina_resumo():
     nom = b.groupby("ano")["total"].sum()
     ytd = b[b["mes"] <= MES_CORTE].groupby("ano")[col].sum()
     du = b[b["ano"] >= URG_DESDE]
-    mediana, med_ano, top1 = estatisticas_base_completa()
+    ex = EXATAS[col]  # medianas e concentração exatas da base completa (pré-calculadas no pipeline)
+    mediana, top1 = ex["mediana"], ex["pareto"]["top1"]
+    med_ano = pd.Series({int(k): v for k, v in ex["mediana_ano"].items()}).sort_index()
     fx = b.groupby("faixa_dur", observed=False).agg(v=("n", "sum"), g=(col, "sum")).reindex(FAIXAS)
     fx = fx / fx.sum()
     lv, lg = fx.loc[["31–90 dias", "> 90 dias"]].sum()
@@ -494,15 +520,14 @@ def pagina_evolucao():
     an = anual_de(df)
     tot, n = df[VAL].sum(), int(df["n"].sum())
     du = df[df["ano"] >= URG_DESDE]
-    vals, vano = valores(VAL), valores("ano")
-    med_ano = pd.Series(vals).groupby(vano).median()
+    med_ano = mediana_por(VAL, "ano")
     comp = [a for a in an.index if a != ANO_PARCIAL]
     dlt = an["valor"].loc[comp[-1]] / an["valor"].loc[comp[-2]] - 1 if len(comp) >= 2 else None
     tem_urg = du["n"].sum() > 0
     kpis(kpi("Gasto total", brl_curto(tot), UNID, an["valor"].values, dlt),
          kpi("Viagens", f"{num(n / 1e6, 2)} mi" if n >= 1e6 else num(n), "realizadas", an["viagens"].values),
          kpi("Ticket médio", brl(tot / n), "gasto ÷ viagens", (an["valor"] / an["viagens"]).values),
-         kpi("Ticket mediano", brl(float(np.median(vals))), "metade custa menos que isso", med_ano.values),
+         kpi("Ticket mediano", brl(mediana_geral(VAL)), "metade custa menos que isso", med_ano.values),
          kpi("Urgentes", pct(du["n_urg"].sum() / du["n"].sum(), 0) if tem_urg else "—", f"desde {URG_DESDE}",
              share(du, "ano", "n_urg").values if tem_urg else None))
     if dlt is not None:
@@ -559,8 +584,7 @@ def pagina_evolucao():
 def pagina_orgaos():
     org = df.groupby("orgao", observed=True).agg(viagens=("n", "sum"), gasto=(VAL, "sum"), o=("n_out", "sum"))
     org = org[org["viagens"] > 0]
-    med = pd.Series(valores(VAL)).groupby(valores("org")).median()
-    org["mediana"] = [med.get(ORG_NOMES.index(o), np.nan) for o in org.index]
+    org["mediana"] = mediana_por(VAL, "orgao").reindex(org.index.astype(str)).to_numpy()
     du = df[df["ano"] >= URG_DESDE]
     urg_org = share(du, "orgao", "n_urg") if du["n"].sum() > 0 else pd.Series(dtype=float)
     org["urg"] = urg_org.reindex(org.index)
@@ -617,11 +641,9 @@ def pagina_perfil():
     fx = df.groupby("faixa_dur", observed=False).agg(v=("n", "sum"), g=(VAL, "sum")).reindex(FAIXAS).fillna(0)
     fx["pv"], fx["pg"] = fx["v"] / fx["v"].sum(), fx["g"] / tot
     lv, lg = fx.loc[["31–90 dias", "> 90 dias"], ["pv", "pg"]].sum()
-    vs = np.sort(valores(VAL))[::-1]
-    cum = np.cumsum(vs, dtype=np.float64) / vs.sum()
-    del vs
-    k1 = max(1, len(cum) // 100)
-    st.markdown(f'<div class="ins">💡 <b>Concentração:</b> 1% das viagens responde por <b>{pct(cum[k1 - 1], 0)}</b> do gasto. '
+    px_, py_ = pareto(VAL)
+    topo = {p: float(np.interp(p / 100, px_, py_)) for p in (1, 10)}
+    st.markdown(f'<div class="ins">💡 <b>Concentração:</b> 1% das viagens responde por <b>{pct(topo[1], 0)}</b> do gasto. '
                 f'Viagens com mais de 30 dias são <b>{pct(lv)}</b> das viagens e <b>{pct(lg, 0)}</b> do gasto.</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2, gap="medium")
     with c1, st.container(border=True):
@@ -634,14 +656,13 @@ def pagina_perfil():
         grafico(f, 340, True)
     with c2, st.container(border=True):
         titulo("Curva de concentração (Pareto)", "% acumulado do gasto, das viagens mais caras para as mais baratas")
-        idx = np.unique(np.geomspace(1, len(cum), 300).astype(int)) - 1
-        f = go.Figure(go.Scatter(x=(idx + 1) / len(cum) * 100, y=cum[idx] * 100, mode="lines", line=dict(color=AZUL, width=3),
+        ok = px_ > 0
+        f = go.Figure(go.Scatter(x=px_[ok] * 100, y=py_[ok] * 100, mode="lines", line=dict(color=AZUL, width=3),
                                  fill="tozeroy", fillcolor="rgba(42,120,214,.08)",
                                  hovertemplate="As %{x:.1f}% mais caras = %{y:.1f}% do gasto<extra></extra>"))
         for p in [1, 10]:
-            k = max(1, len(cum) * p // 100)
-            f.add_scatter(x=[p], y=[cum[k - 1] * 100], mode="markers+text", marker=dict(size=10, color=AZUL_ESC, line=dict(color="#fff", width=2)),
-                          text=[f"{p}% → {num(cum[k - 1] * 100, 0)}%  "], textposition="top left", hoverinfo="skip")
+            f.add_scatter(x=[p], y=[topo[p] * 100], mode="markers+text", marker=dict(size=10, color=AZUL_ESC, line=dict(color="#fff", width=2)),
+                          text=[f"{p}% → {num(topo[p] * 100, 0)}%  "], textposition="top left", hoverinfo="skip")
         f.update_xaxes(type="log", range=[-1, 2], tickvals=[0.1, 1, 10, 100], ticktext=["0,1%", "1%", "10%", "100%"])
         f.update_yaxes(ticksuffix="%", range=[0, 104])
         grafico(f, 340)

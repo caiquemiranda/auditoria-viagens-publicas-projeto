@@ -727,4 +727,3 @@ Todo o processo, com código e resultados, está em `tratamento_e_analise.ipynb`
 
 {"resumo": pagina_resumo, "evolucao": pagina_evolucao, "orgaos": pagina_orgaos, "perfil": pagina_perfil,
  "radar": pagina_radar, "metodo": pagina_metodo}[pag]()
-```[cite: 20]

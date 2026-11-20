@@ -188,22 +188,34 @@ def carregar():
 
     # relacionamentos fato -> dimensões (muitos-para-um) pelas chaves substitutas
     tk = fato["sk_tempo"]
+    fator_arr = dt["fator_ipca"].reindex(tk).to_numpy(dtype="float32")
+    diarias = fato["diarias"].to_numpy(dtype="float32")
+    passagens = fato["passagens"].to_numpy(dtype="float32")
+    outros = fato["outros"].to_numpy(dtype="float32")
+    total = (diarias + passagens + outros).astype("float32")
+    dur = fato["dur"].to_numpy()
+    dia_sem = dt["dia_semana"].reindex(tk).to_numpy().astype("int8")
+
     df = pd.DataFrame({
         "ano": dt["ano"].reindex(tk).to_numpy().astype("int16"),
         "mes": dt["mes"].reindex(tk).to_numpy().astype("int8"),
-        "dia_semana_ini": dt["dia_semana"].reindex(tk).to_numpy().astype("int8"),
-        "fator": dt["fator_ipca"].reindex(tk).to_numpy(),
+        "dia_semana_ini": dia_sem,
+        "fator": fator_arr,
         "orgao": pd.Categorical.from_codes(fato["sk_orgao"].to_numpy() - 1, do["orgao"]),
         "escopo": pd.Categorical(ddi["escopo"].reindex(fato["sk_destino"]).to_numpy()),
         "uf": pd.Categorical(ddi["uf"].reindex(fato["sk_destino"]).to_numpy()),
         "modal": pd.Categorical.from_codes(fato["sk_modal"].to_numpy() - 1, dm["modal"]),
         "faixa_dur": pd.Categorical.from_codes(fato["sk_duracao"].to_numpy() - 1, du["faixa_dur"], ordered=True),
-        "urgente": fato["urgente"].to_numpy(), "dur": fato["dur"].to_numpy(),
-        "diarias": fato["diarias"].to_numpy(), "passagens": fato["passagens"].to_numpy(),
-        "outros": fato["outros"].to_numpy(), "outlier": fato["outlier"].to_numpy(),
+        "urgente": fato["urgente"].to_numpy(),
+        "dur": dur,
+        "diarias": diarias,
+        "passagens": passagens,
+        "outros": outros,
+        "outlier": fato["outlier"].to_numpy(),
+        "total": total,
+        "valor": (total * fator_arr).astype("float32"),
+        "fds": (dur >= 7) | ((dia_sem + dur - 1) >= 5),
     })
-    df["total"] = df["diarias"].astype("float64") + df["passagens"] + df["outros"]
-    df["fds"] = (df["dur"] >= 7) | ((df["dia_semana_ini"] + df["dur"] - 1) >= 5)
     casos = pd.concat([pd.read_parquet(a) for a in sorted(glob(str(DATA / "casos_*.parquet")))], ignore_index=True)
     fator = dt.groupby("ano")["fator_ipca"].first().to_dict()
     return df, casos, dd, fator
@@ -250,7 +262,7 @@ esc, urg, real = st.session_state.f_escopo, st.session_state.f_urg, st.session_s
 UNID = "R$ de dez/2025" if real else "R$ nominais"
 
 
-@st.cache_data(max_entries=16, show_spinner=False)
+@st.cache_data(max_entries=1, show_spinner=False)
 def filtrar(a0, a1, orgs, esc, urg, real):
     m = df_all["ano"].between(a0, a1)
     if orgs:
@@ -259,16 +271,16 @@ def filtrar(a0, a1, orgs, esc, urg, real):
         m &= df_all["escopo"] == esc
     if urg != "Todas":
         m &= (df_all["urgente"] == (urg == "Urgentes")) & (df_all["ano"] >= URG_DESDE)
+    if m.all() and real:
+        return df_all
     d = df_all.loc[m].copy()
-    d["valor"] = d["total"] * (d["fator"] if real else 1.0)
+    if not real:
+        d["valor"] = d["total"]
     return d
 
 
-@st.cache_data(show_spinner=False)
 def base_completa():
-    d = df_all.copy()
-    d["valor"] = d["total"] * d["fator"]
-    return d
+    return df_all
 
 
 df = filtrar(a0, a1, orgs, esc, urg, real)
@@ -446,7 +458,7 @@ def pagina_evolucao():
         v = ytd[ANO_PARCIAL] / ytd[ANO_PARCIAL - 1] - 1
         linhas.append(f"{ANO_PARCIAL} até {MESES[MES_CORTE - 1]}: **{'−' if v < 0 else '+'}{pct(abs(v), 0)}** sobre {ANO_PARCIAL - 1}")
     if linhas:
-        st.markdown('<div class="ins">💡 ' + md_b(" &nbsp;·&nbsp; ".join(linhas)) + "</div>", unsafe_allow_html=True)
+        st.markdown('<div class="ins">💡 ' + md_b("  ·  ".join(linhas)) + "</div>", unsafe_allow_html=True)
 
     c3, c4 = st.columns(2, gap="medium")
     with c3, st.container(border=True):
@@ -715,3 +727,6 @@ Todo o processo, com código e resultados, está em `tratamento_e_analise.ipynb`
 
 {"resumo": pagina_resumo, "evolucao": pagina_evolucao, "orgaos": pagina_orgaos, "perfil": pagina_perfil,
  "radar": pagina_radar, "metodo": pagina_metodo}[pag]()
+```[cite: 20]
+
+É só substituir todo o conteúdo do `app.py` no GitHub, dar **Commit changes** e depois clicar em **Reboot app** no Streamlit Cloud para liberar a memória antiga.

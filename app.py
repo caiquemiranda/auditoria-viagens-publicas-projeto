@@ -171,8 +171,11 @@ def estilo(fig, altura=360, legenda=False):
     return fig
 
 
+LARGURA = {"width": "stretch"} if tuple(int(x) for x in st.__version__.split(".")[:2]) >= (1, 50) else {"use_container_width": True}
+
+
 def grafico(fig, altura=360, legenda=False):
-    st.plotly_chart(estilo(fig, altura, legenda), use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(estilo(fig, altura, legenda), **LARGURA, config={"displayModeBar": False})
 
 
 # ============================================================================ dados (Star Schema)
@@ -250,7 +253,7 @@ with st.sidebar:
              help=f"O campo só é preenchido de forma confiável a partir de {URG_DESDE}; ao filtrar por urgência, os anos anteriores saem.")
     st.toggle("Corrigir pela inflação (IPCA)", key="f_real",
               help="Leva os valores de cada ano a preços de dez/2025 (IPCA anual, IBGE). Sem isso, 2019 e 2025 não são comparáveis.")
-    st.button("↺  Restaurar filtros", on_click=resetar, use_container_width=True)
+    st.button("↺  Restaurar filtros", on_click=resetar, **LARGURA)
     st.divider()
     st.markdown(f'<div class="side-note">📌 {ANO_PARCIAL} é parcial (extração set/{ANO_PARCIAL}).<br>'
                 'Fonte: Portal da Transparência (CGU), Viagens a Serviço. Apenas viagens realizadas. '
@@ -526,7 +529,7 @@ def pagina_orgaos():
         tab = pd.DataFrame({"Órgão": org["orgao"], "Viagens": org["viagens"], "Gasto (R$ mi)": org["gasto"] / 1e6,
                             "% do gasto": org["part"] * 100, "Ticket médio": org["ticket"], "Mediana": org["mediana"],
                             "% urgentes": org["urg"] * 100, "Atípicos/mil": org["atip"] * 1000})
-        st.dataframe(tab, hide_index=True, use_container_width=True, height=400, column_config={
+        st.dataframe(tab, hide_index=True, **LARGURA, height=400, column_config={
             "Viagens": st.column_config.NumberColumn(format="localized"),
             "Gasto (R$ mi)": st.column_config.NumberColumn(format="%.1f"),
             "% do gasto": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=float(tab["% do gasto"].max())),
@@ -660,7 +663,7 @@ def pagina_radar():
         cs["pcdp"] = cs["pcdp"].where(~cs["pcdp"].str.startswith("Informa", na=False), "Sigilosa")
         cs["cargo"] = cs["cargo"].where(~cs["cargo"].str.contains("sigilo", case=False, na=False), "Sigiloso")
         st.dataframe(cs[["ano", "pcdp", "orgao", "orgao_solicitante", "cargo", "inicio", "dur", "escopo", "destinos", "urgente",
-                         "total", "custo_dia", "razao_mediana"]], hide_index=True, use_container_width=True, height=380,
+                         "total", "custo_dia", "razao_mediana"]], hide_index=True, **LARGURA, height=380,
                      column_config={"ano": st.column_config.NumberColumn("Ano", format="%d"), "pcdp": "PCDP",
                                     "orgao": "Órgão superior", "orgao_solicitante": "Órgão solicitante", "cargo": "Cargo",
                                     "inicio": "Início", "dur": "Dias", "escopo": "Escopo", "destinos": "Destinos", "urgente": "Urgente",
@@ -686,7 +689,7 @@ digraph G { rankdir=LR; bgcolor="transparent"; nodesep=0.25; ranksep=0.5;
   M [label="DIM_MODAL\\nmeio · categoria"];
   U [label="DIM_DURACAO\\nfaixa · dias mín/máx"];
   T -> F; O -> F; D -> F; M -> F; U -> F; }
-""", use_container_width=True)
+""", **LARGURA)
     with c2, st.container(border=True):
         titulo("Indicadores (KPIs)", "Como cada número do painel é calculado")
         st.markdown("""

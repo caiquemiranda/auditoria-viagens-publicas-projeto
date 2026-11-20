@@ -1,0 +1,8 @@
+# dados brutos do Portal da Transparência (cada zip > 100 MB, limite do GitHub)
+dados_brutos/
+*.zip
+*.csv
+
+__pycache__/
+.ipynb_checkpoints/
+.venv/
